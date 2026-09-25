@@ -71,14 +71,50 @@ class FakeGateway:
         return evidence
 
 
+def _rule(status: str, action: str, refund: float, party: str) -> dict[str, Any]:
+    return {
+        "case_status": status,
+        "recommended_action": action,
+        "refund_brl": refund,
+        "responsible_parties": [{"party_type": party, "party_id": None}],
+    }
+
+
+def _captured(amount: str, event_at: str = "2018-01-02T10:00:00-03:00") -> dict[str, str]:
+    return {"event_at": event_at, "event_type": "captured", "amount_brl": amount}
+
+
 def fake_data(order_status: str = "canceled") -> dict[str, Any]:
     return {
-        "get_order": {"order_id": ORDER_ID, "order_status": order_status},
-        "get_order_items": [{"order_item_id": "item-1", "seller_id": "seller-1", "price": "79.00"}],
-        "get_payment_timeline": {"payments": [{"payment_value": "79.00"}], "events": []},
+        "get_order": {
+            "order_id": ORDER_ID,
+            "order_status": order_status,
+            "order_purchase_timestamp": "2018-01-02T09:00:00-03:00",
+            "order_approved_at": "2018-01-02T10:00:00-03:00",
+            "order_delivered_customer_date": None,
+            "order_estimated_delivery_date": "2018-01-12T09:00:00-03:00",
+        },
+        "get_order_items": [
+            {"order_item_id": "item-1", "seller_id": "seller-1", "price": "79.00",
+             "freight_value": "10.00"}
+        ],
+        "get_payment_timeline": {
+            "payments": [{"payment_value": "79.00"}],
+            # The second capture lies months outside the order lifecycle: a distractor.
+            "events": [_captured("79.00"), _captured("18.00", "2018-06-01T10:00:00-03:00")],
+        },
         "get_shipment_summary": {"order_id": ORDER_ID, "events": []},
         "get_sellers": [{"seller_id": "seller-1"}],
-        "get_policy": {"policy_version": "EC_POLICY_V1", "rules": {}},
+        "get_policy": {
+            "policy_version": "EC_POLICY_V1",
+            "rules": {
+                "canceled_order_paid": _rule("action_required", "issue_refund", 79.0, "platform"),
+                "payment_mismatch": _rule(
+                    "action_required", "reconcile_payment", 35.0, "payment_provider"
+                ),
+                "valid_split_payment": _rule("no_action", "document_no_action", 0.0, "customer"),
+            },
+        },
     }
 
 
@@ -138,23 +174,26 @@ def test_policy_refunds_paid_canceled_order(tmp_path: Path) -> None:
     assert output["assessment"]["case_status"] == "action_required"
     assert output["financial_resolution"]["recommended_refund_brl"] == 79.0
     assert output["financial_resolution"]["refund_lines"][0]["amount_brl"] == 79.0
-    assert "PROCESS_REFUND" in output["resolution_actions"]
+    assert output["resolution_actions"] == ["issue_refund"]
 
 
 def test_policy_detects_payment_mismatch(tmp_path: Path) -> None:
     data = fake_data(order_status="delivered")
-    data["get_order"]["total_price"] = "80.00"
-    data["get_payment_timeline"]["captured_total_brl"] = "79.00"
+    data["get_payment_timeline"]["events"].append(
+        {"event_at": "2018-01-02T10:00:00-03:00", "event_type": "reconciliation_mismatch",
+         "amount_brl": "35.00", "status": "open"}
+    )
 
     output, _ = run_case(make_case("payment_mismatch"), FakeGateway(data), tmp_path)
 
     assert output["assessment"]["primary_issue"] == "payment_mismatch"
-    assert "INVESTIGATE_PAYMENT_MISMATCH" in output["resolution_actions"]
+    assert output["financial_resolution"]["recommended_refund_brl"] == 35.0
+    assert output["resolution_actions"] == ["reconcile_payment"]
 
 
 def test_policy_detects_valid_split_payment(tmp_path: Path) -> None:
     data = fake_data(order_status="delivered")
-    data["get_payment_timeline"]["installments"] = 3
+    data["get_payment_timeline"]["events"] = [_captured("44.50"), _captured("44.50")]
 
     output, _ = run_case(make_case("valid_split_payment"), FakeGateway(data), tmp_path)
 

@@ -183,10 +183,9 @@ class Coordinator:
             for agent in plan.specialists:
                 task_context = dict(base_context)
                 if agent == PAYMENT_AGENT:
-                    task_context["include_refunds"] = (
-                        plan.intent_family in (FAMILY_REFUND, FAMILY_UNKNOWN)
-                        or plan.claimed_topic in REFUND_TOPICS
-                    )
+                    # Refund state is decisive for several issues and the claimed topic
+                    # may be wrong, so the refund timeline is always audited.
+                    task_context["include_refunds"] = True
                 await self._delegate(ctx, plan, agent, task_context)
 
         # 3. Policy agent drafts the decision, then hands off to the verifier.
