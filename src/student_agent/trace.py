@@ -49,3 +49,62 @@ class TraceWriter:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
         return event
+
+    def emit_handoff(
+        self,
+        *,
+        case_id: str,
+        actor: str,
+        target: str,
+        decision_code: str | None = None,
+        attributes: dict[str, str | int | float | bool | None] | None = None,
+    ) -> dict[str, Any]:
+        """Emit observable agent handoff event."""
+        return self.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor=actor,
+            target=target,
+            decision_code=decision_code,
+            attributes=attributes,
+        )
+
+    def emit_tool_call(
+        self,
+        *,
+        case_id: str,
+        actor: str,
+        tool_name: str,
+        evidence_refs: list[str],
+        attributes: dict[str, str | int | float | bool | None] | None = None,
+    ) -> dict[str, Any]:
+        """Emit observable tool call / result consumption event."""
+        return self.emit(
+            case_id=case_id,
+            event_type="tool_result_consumed",
+            actor=actor,
+            tool_name=tool_name,
+            evidence_refs=evidence_refs,
+            attributes=attributes,
+        )
+
+    def emit_decision(
+        self,
+        *,
+        case_id: str,
+        actor: str,
+        decision_code: str,
+        target: str | None = None,
+        evidence_refs: list[str] | None = None,
+        attributes: dict[str, str | int | float | bool | None] | None = None,
+    ) -> dict[str, Any]:
+        """Emit observable policy decision rationale event."""
+        return self.emit(
+            case_id=case_id,
+            event_type="policy_decided",
+            actor=actor,
+            target=target,
+            decision_code=decision_code,
+            evidence_refs=evidence_refs,
+            attributes=attributes,
+        )
