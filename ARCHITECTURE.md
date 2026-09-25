@@ -76,6 +76,22 @@ class StateDict(TypedDict):
 - Mọi agent chạy trong try/except của `Coordinator._delegate`; lỗi → handoff `*_ERROR`, case vẫn ra output hợp lệ.
 - Mỗi lần giao việc: `task_assigned` (coordinator → agent, attributes `intent_family`, `claimed_topic`, `route_reason`) và `handoff` (agent → coordinator, decision_code `ORDER_VERIFIED` / `*_NOT_FOUND` / `*_ERROR`). Policy handoff thẳng sang verifier (`DRAFT_READY`), verifier trả về coordinator (`APPROVED`). `case_received`/`case_finalized` do CLI emit.
 
+### 1.5. Policy và Verifier (Pha 4)
+
+- `policy_agent` chỉ quyết định từ dữ liệu đã lưu trong `CaseState`; customer topic
+   chỉ dùng để định tuyến, không được dùng làm ground truth.
+- Các rule quyết định có bằng chứng rõ ràng gồm: đơn `canceled` hoặc `unavailable`
+   đã thanh toán thì tạo refund theo tổng payment; refund `pending`/`processing`/
+   `failed`; payment mismatch; valid split payment; duplicate payment signal; và
+   giao trễ khi shipment summary xác nhận seller hoặc logistics chịu trách nhiệm.
+- Mỗi claim `supported` hoặc `partially_supported` phải có ít nhất một
+   `evidence_ref`. Khi dữ liệu chưa đủ, policy dùng `insufficient_evidence`,
+   `needs_investigation` và confidence thấp thay vì suy đoán.
+- Verifier kiểm tra và hiệu chỉnh claim-evidence linkage, tổng `refund_lines`,
+   action `PROCESS_REFUND` khi có tiền hoàn, trách nhiệm seller/logistics và bounds
+   của confidence trước khi bàn giao output cho coordinator. Draft malformed được
+   hạ về safe output thay vì làm hỏng toàn bộ case.
+
 ---
 
 ## 2. A2A Message Contract

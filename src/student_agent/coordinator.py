@@ -83,6 +83,7 @@ class IntentPlan:
     intent_family: str
     refund_requested: bool
     claim_ids: list[str]
+    claim_topics: list[str]
     specialists: list[str] = field(default_factory=list)
     route_reasons: dict[str, str] = field(default_factory=dict)
 
@@ -117,6 +118,7 @@ def analyze_intent(case: dict[str, Any]) -> IntentPlan:
         intent_family=family,
         refund_requested="requested_full_refund" in topics,
         claim_ids=[str(claim["claim_id"]) for claim in claims if claim.get("claim_id")],
+        claim_topics=[str(claim["topic"]) for claim in claims if claim.get("claim_id")],
     )
     for agent in FAMILY_SPECIALISTS[family]:
         plan.add(agent, "intent")
@@ -161,6 +163,11 @@ class Coordinator:
             "claimed_topic": plan.claimed_topic,
             "intent_family": plan.intent_family,
             "claim_ids": plan.claim_ids,
+            "claim_topics": [
+                str(claim.get("topic"))
+                for claim in (case.get("customer_request") or {}).get("claims", [])
+                if isinstance(claim, dict) and claim.get("claim_id")
+            ],
         }
 
         # 1. Order agent always runs first: it confirms the claimed order exists in scope.
@@ -200,7 +207,10 @@ class Coordinator:
         )
         output = verifier_out.findings.get("output")
         if not isinstance(output, dict):
-            output, _ = verify_output(draft, state)
+            try:
+                output, _ = verify_output(draft, state)
+            except (KeyError, TypeError, ValueError):
+                output = build_safe_output(state, base_context)
         return output
 
     async def _delegate(

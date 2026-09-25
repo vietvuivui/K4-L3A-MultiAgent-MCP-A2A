@@ -160,6 +160,7 @@ async def payment_agent(task: AgentInput, ctx: AgentContext) -> AgentOutput:
             "status": STATUS_OK,
             "payments": data.get("payments", []),
             "payment_events": data.get("events", []),
+            "payment_summary": data,
             "refund_events": refunds["data"] if refunds else None,
             "evidence": {
                 "payment_timeline": timeline["evidence_ref"],
@@ -196,12 +197,7 @@ async def shipment_agent(task: AgentInput, ctx: AgentContext) -> AgentOutput:
 
 
 async def policy_agent(task: AgentInput, ctx: AgentContext) -> AgentOutput:
-    """PLACEHOLDER — replace with real decision rules before submitting.
-
-    Loads the policy so the real implementation can use ``ctx.state.context['policy']``,
-    then drafts a conservative ``insufficient_evidence`` output that only cites
-    evidence actually collected in this case.
-    """
+    """Draft a deterministic decision from authoritative specialist findings."""
     policy = await call_tool(
         ctx, POLICY_AGENT, "get_policy", policy_version=task.context["policy_version"]
     )
@@ -210,7 +206,7 @@ async def policy_agent(task: AgentInput, ctx: AgentContext) -> AgentOutput:
             "policy", {"data": policy["data"], "evidence_ref": policy["evidence_ref"]}
         )
 
-    draft = build_safe_output(ctx.state, task.context)
+    draft = build_policy_output(ctx.state, task.context)
     ctx.state.update_decision(draft)
     ctx.trace.emit_decision(
         case_id=ctx.case_id,
@@ -220,7 +216,6 @@ async def policy_agent(task: AgentInput, ctx: AgentContext) -> AgentOutput:
         attributes={
             "case_status": draft["assessment"]["case_status"],
             "refund_brl": draft["financial_resolution"]["recommended_refund_brl"],
-            "placeholder": True,
         },
     )
     return AgentOutput(
@@ -287,6 +282,255 @@ def build_safe_output(state: CaseState, context: dict[str, Any]) -> dict[str, An
     }
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rows_total(rows: Any, *keys: str) -> float:
+    if not isinstance(rows, list):
+        return 0.0
+    total = 0.0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in keys:
+            amount = _as_float(row.get(key))
+            if amount is not None:
+                total += amount
+                break
+    return round(total, 2)
+
+
+def _refs_for_domain(state: CaseState, *actors: str) -> list[str]:
+    meta = state.context.get("evidence_meta", {})
+    return [ref for ref, info in meta.items() if info.get("actor") in actors]
+
+
+def _claim_assessments(
+    context: dict[str, Any],
+    verdict: str,
+    confidence: float,
+    refs: list[str],
+    issue: str,
+) -> list[dict[str, Any]]:
+    assessments = []
+    for claim_id, topic in zip(
+        context.get("claim_ids", []), context.get("claim_topics", []), strict=True
+    ):
+        claim_verdict = verdict
+        claim_refs = list(refs)
+        claim_confidence = confidence
+        if topic == issue:
+            claim_verdict = "supported"
+        elif topic == "requested_full_refund":
+            claim_verdict = "supported" if issue in {
+                "canceled_order_paid", "unavailable_order_paid", "refund_pending", "refund_failed"
+            } else "unsupported"
+            claim_confidence = (
+                min(confidence, 0.6) if claim_verdict == "unsupported" else confidence
+            )
+        else:
+            claim_verdict = "insufficient_evidence"
+            claim_confidence = 0.3
+            claim_refs = []
+        assessments.append({
+            "claim_id": claim_id,
+            "verdict": claim_verdict,
+            "confidence": claim_confidence,
+            "evidence_refs": claim_refs,
+        })
+    return assessments[:5]
+
+
+def _decision_output(
+    state: CaseState,
+    context: dict[str, Any],
+    *,
+    issue: str,
+    status: str,
+    confidence: float,
+    refs: list[str],
+    cause: str,
+    parties: list[dict[str, str | None]],
+    refund: float = 0.0,
+    refund_reason: str | None = None,
+    action: str | None = None,
+    verdict: str = "supported",
+) -> dict[str, Any]:
+    unique_refs = list(dict.fromkeys(refs))[:30]
+    lines = []
+    if refund > 0:
+        lines = [{
+            "reason_code": refund_reason or issue.upper(),
+            "amount_brl": refund,
+            "entity_id": context.get("order_id"),
+        }]
+    actions = [action] if action else (
+        ["REJECT_CLAIM"] if verdict == "unsupported" else ["ESCALATE_MANUAL_REVIEW"]
+    )
+    return {
+        "schema_version": "day09-l3a-output-v2",
+        "case_id": state.case_id,
+        "assessment": {"primary_issue": issue, "case_status": status, "confidence": confidence},
+        "affected_entities": affected_entities_from_state(state),
+        "claim_assessments": _claim_assessments(
+            context, verdict, confidence, unique_refs, issue
+        ),
+        "root_cause_analysis": {
+            "ranked_causes": [{"cause_code": cause, "rank": 1}],
+            "responsible_parties": parties,
+        },
+        "evidence_refs": unique_refs,
+        "data_conflicts": [],
+        "financial_resolution": {
+            "currency": "BRL",
+            "recommended_refund_brl": refund,
+            "refund_lines": lines,
+        },
+        "resolution_actions": actions,
+    }
+
+
+def build_policy_output(state: CaseState, context: dict[str, Any]) -> dict[str, Any]:
+    """Apply deterministic rules and stay conservative when facts are incomplete."""
+    order = state.context.get("order", {})
+    if order.get("status") != STATUS_OK:
+        return build_safe_output(state, context)
+
+    order_status = order.get("order_status")
+    order_refs = _refs_for_domain(state, ORDER_AGENT)
+    payment = state.context.get("payment", {})
+    payment_refs = _refs_for_domain(state, PAYMENT_AGENT)
+    shipment = state.context.get("shipment", {})
+    shipment_refs = _refs_for_domain(state, SHIPMENT_AGENT)
+    payment_rows = payment.get("payments", [])
+    payment_summary = payment.get("payment_summary", {})
+    captured = _as_float(payment_summary.get("captured_total_brl")) or _rows_total(
+        payment_rows, "payment_value", "captured_total_brl", "amount_brl", "value"
+    )
+    refund_events = payment.get("refund_events")
+    refund_statuses = {
+        str(row.get("status", "")).lower()
+        for row in refund_events or []
+        if isinstance(row, dict)
+    }
+
+    if order_status == "canceled" and captured > 0:
+        return _decision_output(
+            state, context, issue="canceled_order_paid", status="action_required", confidence=0.95,
+            refs=order_refs + payment_refs, cause="ORDER_CANCELED_AFTER_PAYMENT",
+            parties=[{"party_type": "platform", "party_id": None}], refund=captured,
+            refund_reason="CANCELED_ORDER_PAYMENT", action="PROCESS_REFUND",
+        )
+    if order_status == "unavailable" and captured > 0:
+        return _decision_output(
+            state,
+            context,
+            issue="unavailable_order_paid",
+            status="action_required",
+            confidence=0.95,
+            refs=order_refs + payment_refs, cause="ORDER_UNAVAILABLE_AFTER_PAYMENT",
+            parties=[{"party_type": "platform", "party_id": None}], refund=captured,
+            refund_reason="UNAVAILABLE_ORDER_PAYMENT", action="PROCESS_REFUND",
+        )
+    if "failed" in refund_statuses:
+        return _decision_output(
+            state, context, issue="refund_failed", status="action_required", confidence=0.9,
+            refs=payment_refs, cause="REFUND_FAILED",
+            parties=[{"party_type": "platform", "party_id": None}], action="RETRY_REFUND",
+        )
+    if {"pending", "processing"} & refund_statuses:
+        return _decision_output(
+            state, context, issue="refund_pending", status="action_required", confidence=0.88,
+            refs=payment_refs, cause="REFUND_PENDING",
+            parties=[{"party_type": "platform", "party_id": None}], action="MONITOR_REFUND",
+        )
+
+    payment_ids = [
+        str(row.get("payment_id") or row.get("transaction_id"))
+        for row in payment_rows
+        if isinstance(row, dict) and (row.get("payment_id") or row.get("transaction_id"))
+    ]
+    payment_events = payment.get("payment_events", [])
+    explicit_duplicate = any(
+        isinstance(row, dict)
+        and (row.get("duplicate_charge") is True or row.get("is_duplicate") is True)
+        for row in [*payment_rows, *payment_events]
+    )
+    if (payment_ids and len(payment_ids) != len(set(payment_ids))) or explicit_duplicate:
+        return _decision_output(
+            state, context, issue="duplicate_charge", status="action_required", confidence=0.9,
+            refs=payment_refs, cause="DUPLICATE_PAYMENT_REFERENCE",
+            parties=[{"party_type": "payment_provider", "party_id": None}],
+            action="INVESTIGATE_DUPLICATE_CHARGE",
+        )
+
+    order_data = order.get("order", {})
+    order_total = next(
+        (
+            _as_float(order_data.get(key))
+            for key in ("order_total_brl", "total_price", "order_total", "total_amount")
+            if _as_float(order_data.get(key)) is not None
+        ),
+        None,
+    )
+    if order_total is not None and captured > 0 and abs(order_total - captured) >= 0.01:
+        return _decision_output(
+            state, context, issue="payment_mismatch", status="action_required", confidence=0.9,
+            refs=order_refs + payment_refs, cause="ORDER_PAYMENT_TOTAL_MISMATCH",
+            parties=[{"party_type": "payment_provider", "party_id": None}],
+            action="INVESTIGATE_PAYMENT_MISMATCH",
+        )
+
+    installment_values = [
+        payment_summary.get(key)
+        for key in ("payment_installments", "installments", "installment_count")
+    ] + [
+        row.get(key)
+        for row in payment_rows
+        if isinstance(row, dict)
+        for key in ("payment_installments", "installments", "installment_count")
+    ]
+    if any((_as_float(value) or 0) > 1 for value in installment_values):
+        return _decision_output(
+            state, context, issue="valid_split_payment", status="no_action", confidence=0.9,
+            refs=payment_refs, cause="VALID_INSTALLMENT_PAYMENT",
+            parties=[{"party_type": "payment_provider", "party_id": None}],
+            action="CONFIRM_SPLIT_PAYMENT",
+        )
+
+    shipment_data = shipment.get("shipment", {})
+    if isinstance(shipment_data, dict):
+        late_seller = bool(
+            shipment_data.get("late_delivery_seller") or shipment_data.get("late_seller")
+        )
+        late_logistics = bool(
+            shipment_data.get("late_delivery_logistics")
+            or shipment_data.get("late_logistics")
+        )
+        if late_seller or late_logistics:
+            issue = "late_delivery_seller" if late_seller else "late_delivery_logistics"
+            party_type = "seller" if late_seller else "logistics_provider"
+            return _decision_output(
+                state, context, issue=issue, status="action_required", confidence=0.88,
+                refs=order_refs + shipment_refs, cause=issue.upper(),
+                parties=[{"party_type": party_type, "party_id": None}], action="OFFER_COMPENSATION",
+            )
+
+    if not order_refs + payment_refs + shipment_refs:
+        return build_safe_output(state, context)
+    return _decision_output(
+        state, context, issue="unsupported_claim", status="no_action", confidence=0.72,
+        refs=order_refs, cause="CLAIM_NOT_SUPPORTED_BY_EVIDENCE",
+        parties=[{"party_type": "platform", "party_id": None}], verdict="unsupported",
+    )
+
+
 # --- Verifier --------------------------------------------------------------------
 
 
@@ -306,13 +550,27 @@ def verify_output(draft: dict[str, Any], state: CaseState) -> tuple[dict[str, An
         claim_refs = [ref for ref in dict.fromkeys(claim.get("evidence_refs", [])) if ref in pool]
         if claim_refs != claim.get("evidence_refs", []):
             failed.append("CLAIM_EVIDENCE_NOT_IN_POOL")
-        confidence = min(max(float(claim.get("confidence", 0.0)), 0.0), 1.0)
+        try:
+            confidence = min(max(float(claim.get("confidence", 0.0)), 0.0), 1.0)
+        except (TypeError, ValueError):
+            failed.append("CLAIM_CONFIDENCE_INVALID")
+            confidence = 0.3
+        verdict = claim.get("verdict", "insufficient_evidence")
+        if verdict in {"supported", "partially_supported"} and not claim_refs:
+            failed.append("SUPPORTED_CLAIM_WITHOUT_EVIDENCE")
+            verdict = "insufficient_evidence"
+            confidence = 0.3
         claims.append({**claim, "evidence_refs": claim_refs, "confidence": confidence})
+        claims[-1]["verdict"] = verdict
     if "claim_assessments" in output:
         output["claim_assessments"] = claims
 
     assessment = dict(output["assessment"])
-    confidence = min(max(float(assessment.get("confidence", 0.0)), 0.0), 1.0)
+    try:
+        confidence = min(max(float(assessment.get("confidence", 0.0)), 0.0), 1.0)
+    except (TypeError, ValueError):
+        failed.append("CONFIDENCE_INVALID")
+        confidence = 0.3
     if confidence != assessment.get("confidence"):
         failed.append("CONFIDENCE_OUT_OF_BOUNDS")
     assessment["confidence"] = confidence
@@ -325,8 +583,22 @@ def verify_output(draft: dict[str, Any], state: CaseState) -> tuple[dict[str, An
     ):
         failed.append("NO_ACTION_WITH_REFUND")
         lines = []
-    total = round(sum(float(line["amount_brl"]) for line in lines), 2)
-    if abs(total - float(financial.get("recommended_refund_brl", 0.0))) >= 0.01:
+    valid_lines = []
+    for line in lines:
+        try:
+            amount = float(line["amount_brl"])
+        except (KeyError, TypeError, ValueError):
+            failed.append("REFUND_LINE_INVALID")
+            continue
+        valid_lines.append({**line, "amount_brl": amount})
+    lines = valid_lines
+    try:
+        recommended = float(financial.get("recommended_refund_brl", 0.0))
+    except (TypeError, ValueError):
+        failed.append("REFUND_TOTAL_INVALID")
+        recommended = 0.0
+    total = round(sum(line["amount_brl"] for line in lines), 2)
+    if abs(total - recommended) >= 0.01:
         failed.append("REFUND_TOTAL_MISMATCH")
     financial.update({"currency": "BRL", "refund_lines": lines, "recommended_refund_brl": total})
     output["financial_resolution"] = financial
@@ -334,6 +606,26 @@ def verify_output(draft: dict[str, Any], state: CaseState) -> tuple[dict[str, An
     actions = list(dict.fromkeys(output.get("resolution_actions", [])))
     if actions != output.get("resolution_actions", []):
         failed.append("DUPLICATE_ACTIONS")
+    if total > 0 and "PROCESS_REFUND" not in actions:
+        failed.append("REFUND_WITHOUT_PROCESS_ACTION")
+        actions.insert(0, "PROCESS_REFUND")
+    if assessment["case_status"] == "no_action" and total > 0:
+        failed.append("NO_ACTION_WITH_REFUND")
+        financial["recommended_refund_brl"] = 0.0
+        financial["refund_lines"] = []
+        actions = [action for action in actions if action != "PROCESS_REFUND"]
+
+    issue = assessment.get("primary_issue")
+    parties = list(output.get("root_cause_analysis", {}).get("responsible_parties", []))
+    required_party = {
+        "late_delivery_seller": "seller",
+        "late_delivery_logistics": "logistics_provider",
+    }.get(issue)
+    if required_party and not any(party.get("party_type") == required_party for party in parties):
+        failed.append("RESPONSIBILITY_MISMATCH")
+        parties.append({"party_type": required_party, "party_id": None})
+        output["root_cause_analysis"]["responsible_parties"] = parties[:5]
+
     output["resolution_actions"] = actions[:8]
 
     return output, failed

@@ -7,7 +7,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from student_agent.agents import PAYMENT_AGENT, SHIPMENT_AGENT
+from student_agent.agents import PAYMENT_AGENT, SHIPMENT_AGENT, verify_output
 from student_agent.contracts import WORKFLOW_REQUIRED_EVENTS, Contracts
 from student_agent.coordinator import (
     FAMILY_DELIVERY,
@@ -15,6 +15,7 @@ from student_agent.coordinator import (
     FAMILY_UNKNOWN,
     analyze_intent,
 )
+from student_agent.state import CaseState
 from student_agent.trace import TraceWriter
 from student_agent.workflow import solve_case
 
@@ -128,6 +129,71 @@ def test_workflow_emits_required_events_and_valid_output(tmp_path: Path) -> None
         for ref in e["evidence_refs"]
     }
     assert set(output["evidence_refs"]) <= consumed
+
+
+def test_policy_refunds_paid_canceled_order(tmp_path: Path) -> None:
+    output, _ = run_case(make_case("canceled_order_paid"), FakeGateway(fake_data()), tmp_path)
+
+    assert output["assessment"]["primary_issue"] == "canceled_order_paid"
+    assert output["assessment"]["case_status"] == "action_required"
+    assert output["financial_resolution"]["recommended_refund_brl"] == 79.0
+    assert output["financial_resolution"]["refund_lines"][0]["amount_brl"] == 79.0
+    assert "PROCESS_REFUND" in output["resolution_actions"]
+
+
+def test_policy_detects_payment_mismatch(tmp_path: Path) -> None:
+    data = fake_data(order_status="delivered")
+    data["get_order"]["total_price"] = "80.00"
+    data["get_payment_timeline"]["captured_total_brl"] = "79.00"
+
+    output, _ = run_case(make_case("payment_mismatch"), FakeGateway(data), tmp_path)
+
+    assert output["assessment"]["primary_issue"] == "payment_mismatch"
+    assert "INVESTIGATE_PAYMENT_MISMATCH" in output["resolution_actions"]
+
+
+def test_policy_detects_valid_split_payment(tmp_path: Path) -> None:
+    data = fake_data(order_status="delivered")
+    data["get_payment_timeline"]["installments"] = 3
+
+    output, _ = run_case(make_case("valid_split_payment"), FakeGateway(data), tmp_path)
+
+    assert output["assessment"]["primary_issue"] == "valid_split_payment"
+    assert output["assessment"]["case_status"] == "no_action"
+
+
+def test_verifier_handles_malformed_numeric_fields() -> None:
+    state = CaseState(case_id="L3A_CASE_001")
+    draft = {
+        "schema_version": "day09-l3a-output-v2",
+        "case_id": state.case_id,
+        "assessment": {
+            "primary_issue": "insufficient_evidence",
+            "case_status": "needs_investigation",
+            "confidence": "bad",
+        },
+        "affected_entities": {
+            "order_ids": [], "item_ids": [], "seller_ids": [],
+            "payment_references": [], "shipment_ids": [],
+        },
+        "claim_assessments": [],
+        "root_cause_analysis": {
+            "ranked_causes": [{"cause_code": "BAD_DATA", "rank": 1}],
+            "responsible_parties": [{"party_type": "unknown", "party_id": None}],
+        },
+        "evidence_refs": [],
+        "data_conflicts": [],
+        "financial_resolution": {
+            "currency": "BRL", "recommended_refund_brl": "bad", "refund_lines": [],
+        },
+        "resolution_actions": [],
+    }
+
+    output, failed = verify_output(draft, state)
+
+    assert output["assessment"]["confidence"] == 0.3
+    assert output["financial_resolution"]["recommended_refund_brl"] == 0.0
+    assert "CONFIDENCE_INVALID" in failed
 
 
 def test_missing_order_skips_specialists_and_still_returns_output(tmp_path: Path) -> None:
