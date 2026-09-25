@@ -87,8 +87,11 @@ async def call_tool(
             evidence = await ctx.gateway.call(tool_name, case_id=ctx.case_id, **arguments)
             break
         except RuntimeError:
-            # Gateway returned isError: not found / no rows for this scoped entity.
-            return None
+            # Gateway returned isError: either not found for this scoped entity or a
+            # transient backend failure. Retry the identical call before giving up.
+            if attempt >= MAX_RETRIES:
+                return None
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS[attempt])
         except ValueError:
             # Malformed envelope: never fabricate, never retry into a different answer.
             return None

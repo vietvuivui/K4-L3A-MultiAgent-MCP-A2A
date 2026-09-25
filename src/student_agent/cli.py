@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 from .cases import load_case_set
@@ -44,7 +45,12 @@ async def _run(root: Path) -> None:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        total = len(case_set.case_ids)
+        started = time.monotonic()
+        print(f"Running {total} cases with {len(discovered_tools)} MCP tools...", flush=True)
+        for index, case_id in enumerate(case_set.case_ids, 1):
+            case_started = time.monotonic()
+            print(f"[{index:>3}/{total}] {case_id} ... ", end="", flush=True)
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
             output = await solve_case(case, gateway, trace)
@@ -58,6 +64,13 @@ async def _run(root: Path) -> None:
             )
             temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            assessment = output.get("assessment", {})
+            print(
+                f"{assessment.get('primary_issue')} / {assessment.get('case_status')} "
+                f"({time.monotonic() - case_started:.1f}s)",
+                flush=True,
+            )
+        print(f"DONE: {total} outputs in {time.monotonic() - started:.1f}s", flush=True)
 
 
 def parser() -> argparse.ArgumentParser:
