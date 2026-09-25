@@ -16,14 +16,14 @@ Hệ thống xử lý khiếu nại theo mô hình **Pipeline phân quyền kế
           ▼
     Coordinator (Khởi tạo case, trích xuất thực thể sơ bộ, phân công task)
           │
-          ├───► Order/Item Agent  ──[MCP: order, item, seller]──┐
+          ├───► Order/Item Agent  ──[MCP: order, item]──────────┐
           │                                                     │
           ├───► Payment Agent     ──[MCP: payment, refund]──────┤  (Specialist Collaboration)
           │                                                     │
-          └───► Shipment Agent    ──[MCP: shipment, tracking]───┘
+          └───► Shipment Agent    ──[MCP: shipment, seller]─────┘
                                         │
                                         ▼
-                                  Policy Agent  ──[MCP: policy, rules]
+                                  Policy Agent  ──[MCP: policy]
                                         │
                                         ▼
                                   Verifier Agent (Kiểm định Invariants & Cross-field Consistency)
@@ -44,10 +44,10 @@ Hệ thống xử lý khiếu nại theo mô hình **Pipeline phân quyền kế
 | Actor | Input | Trách nhiệm | Tool permissions | Output / Handoff |
 | --- | --- | --- | --- | --- |
 | **Coordinator** (`coordinator`) | `inputs/<case_id>.json` | Tiếp nhận case, emit `case_received`, bóc tách các trường định danh ban đầu, lập lịch và ủy quyền cho specialists qua `task_assigned`, nhận kết quả đã verify để emit `case_finalized` và lưu file output. | Không gọi domain tools (chỉ discovery tools nếu cần). | Phân phối nhiệm vụ điều tra kèm `case_id` cho `order-item-agent`. |
-| **Order/Item Agent** (`order-item-agent`) | `case_id`, `order_id` (trích từ message/case) | Xác thực tính hợp lệ của đơn hàng, trạng thái vòng đời đơn (`order_status`), danh mục các items, thông tin người bán (`seller_id`), giá niêm yết và phụ phí. | `get_order`<br>`get_order_items`<br>`get_seller`<br>`get_product` | Bộ dữ liệu đơn hàng đã xác thực, danh sách `order_ids`, `item_ids`, `seller_ids`, `evidence_refs`, bàn giao sang `payment-agent` và `shipment-agent`. |
-| **Payment Agent** (`payment-agent`) | `case_id`, `order_id`, payment references | Đối soát giao dịch thanh toán: phương thức, số đợt trả góp, tổng tiền thanh toán (`captured_total_brl`), phát hiện thanh toán trùng (`duplicate_charge`), lệch tiền (`payment_mismatch`), trạng thái hoàn tiền (`refund_pending`, `refund_failed`). | `get_payments`<br>`get_refunds` | Trạng thái thanh toán, `payment_references`, số tiền đã thanh toán/hoàn trả, `evidence_refs`, bàn giao dữ liệu tài chính cho `policy-agent`. |
-| **Shipment Agent** (`shipment-agent`) | `case_id`, `order_id`, timeline vận chuyển | Phân tích hành trình giao hàng: so sánh `shipping_limit_date`, ngày bàn giao đơn vị vận chuyển (`carrier_delivered_date`), ngày giao thực tế (`delivered_customer_date`) và ngày dự kiến (`estimated_delivery_date`). Phân định trách nhiệm trễ hạn: do Seller giao muộn (`late_delivery_seller`) hay do Logistics (`late_delivery_logistics`), hàng thất lạc (`lost`). | `get_shipment`<br>`get_tracking` | Phán quyết vận chuyển (`shipment_verdict`), danh sách `shipment_ids`, `late_seller_ids`, `evidence_refs`, bàn giao sang `policy-agent`. |
-| **Policy Agent** (`policy-agent`) | Báo cáo tổng hợp từ Order, Payment, Shipment, nội dung khiếu nại | Đối soát chính sách bồi hoàn của nền tảng, xác định `primary_issue` (11 enum), tìm nguyên nhân gốc rễ (`ranked_causes`), quy trách nhiệm (`responsible_parties`), tính số tiền hoàn trả (`financial_resolution`) bằng BRL, xác định các hành động khắc phục (`resolution_actions`). | `get_policy`<br>`get_dispute_rules` | Dự thảo đầy đủ của case output kèm toàn bộ `evidence_refs`, bàn giao sang `verifier`. |
+| **Order/Item Agent** (`order-item-agent`) | `case_id`, `order_id` (trích từ message/case) | Xác thực tính hợp lệ của đơn hàng, trạng thái vòng đời đơn (`order_status`), danh mục các items, thông tin người bán (`seller_id`), giá niêm yết và phụ phí. | `get_order`<br>`get_order_items` | Bộ dữ liệu đơn hàng đã xác thực, danh sách `order_ids`, `item_ids`, `seller_ids`, `evidence_refs`, bàn giao sang `payment-agent` và `shipment-agent`. |
+| **Payment Agent** (`payment-agent`) | `case_id`, `order_id`, payment references | Đối soát giao dịch thanh toán: phương thức, số đợt trả góp, tổng tiền thanh toán (`captured_total_brl`), phát hiện thanh toán trùng (`duplicate_charge`), lệch tiền (`payment_mismatch`), trạng thái hoàn tiền (`refund_pending`, `refund_failed`). | `get_payment_timeline`<br>`get_order_payments`<br>`get_refund_timeline` | Trạng thái thanh toán, `payment_references`, số tiền đã thanh toán/hoàn trả, `evidence_refs`, bàn giao dữ liệu tài chính cho `policy-agent`. |
+| **Shipment Agent** (`shipment-agent`) | `case_id`, `order_id`, timeline vận chuyển | Phân tích hành trình giao hàng: so sánh `shipping_limit_date`, ngày bàn giao đơn vị vận chuyển (`carrier_delivered_date`), ngày giao thực tế (`delivered_customer_date`) và ngày dự kiến (`estimated_delivery_date`). Phân định trách nhiệm trễ hạn: do Seller giao muộn (`late_delivery_seller`) hay do Logistics (`late_delivery_logistics`), hàng thất lạc (`lost`). | `get_shipment_summary`<br>`get_sellers` | Phán quyết vận chuyển (`shipment_verdict`), danh sách `shipment_ids`, `late_seller_ids`, `evidence_refs`, bàn giao sang `policy-agent`. |
+| **Policy Agent** (`policy-agent`) | Báo cáo tổng hợp từ Order, Payment, Shipment, nội dung khiếu nại | Đối soát chính sách bồi hoàn của nền tảng, xác định `primary_issue` (11 enum), tìm nguyên nhân gốc rễ (`ranked_causes`), quy trách nhiệm (`responsible_parties`), tính số tiền hoàn trả (`financial_resolution`) bằng BRL, xác định các hành động khắc phục (`resolution_actions`). | `get_policy` (tham số `policy_version`) | Dự thảo đầy đủ của case output kèm toàn bộ `evidence_refs`, bàn giao sang `verifier`. |
 | **Verifier** (`verifier`) | Dự thảo case output, case input gốc, tập hợp `evidence_refs` đã thu thập | Kiểm tra độc lập toàn diện: tính tuân thủ JSON schema `l3a-output-v2`, kiểm tra scope thực thể, tính nhất quán tài chính (tổng tiền hoàn = tổng refund lines), tính tương thích trách nhiệm và hiệu chuẩn `confidence`. Emit `verification_completed`. | Không có quyền gọi MCP tools (chỉ thực thi logic kiểm định thuần túy). | Kết quả thẩm định đạt chuẩn, chuyển lại cho `coordinator` để phát hành output. |
 
 ### 1.3. Thiết kế State Schema: `case_id`, `evidence_pool`, `decision`
@@ -66,6 +66,15 @@ class StateDict(TypedDict):
 - **`evidence_pool`**: Lưu trữ tập trung các bằng chứng được trả về từ MCP Gateway (`day09-mcp-evidence-v1`), đánh chỉ mục theo `evidence_ref`. Mọi truy xuất bằng chứng trong quá trình sinh output hay ghi trace đều lấy từ pool này, ngăn chặn ref ảo hoặc ref từ case khác.
 - **`decision`**: Chứa trạng thái quyết định đang phát triển gồm: `assessment`, `affected_entities`, `root_cause_analysis`, `financial_resolution`, `resolution_actions`, và `claim_assessments`.
 - **`context`**: Bộ nhớ đệm lưu các phát hiện trung gian (ví dụ: `order_data`, `payment_summary`, `shipping_timeline`) được chuyển giao giữa các agent.
+
+### 1.4. Coordinator: phân tích intent & điều phối (`src/student_agent/coordinator.py`)
+
+- `analyze_intent(case)` đọc `claims[].topic`, `claimed_order_id`, `policy_version` → `IntentPlan`. Topic khách khai **chỉ là giả thuyết định tuyến**, không quyết định `primary_issue`.
+- Nhóm intent: `payment` (canceled/unavailable/split/mismatch/duplicate), `refund` (refund_pending/failed), `delivery` (late_delivery_*), `unknown` (còn lại). Specialist của nhóm được gọi trước; `BROAD_SCAN=True` gọi thêm các domain còn lại ("fetch broad, cite narrow").
+- `refine_plan()` điều chỉnh sau khi có dữ liệu order thật: `order_status ∈ {canceled, unavailable}` → đẩy `payment-agent` lên đầu.
+- Order không tồn tại → bỏ qua specialist, policy nhận `order_verified=False`.
+- Mọi agent chạy trong try/except của `Coordinator._delegate`; lỗi → handoff `*_ERROR`, case vẫn ra output hợp lệ.
+- Mỗi lần giao việc: `task_assigned` (coordinator → agent, attributes `intent_family`, `claimed_topic`, `route_reason`) và `handoff` (agent → coordinator, decision_code `ORDER_VERIFIED` / `*_NOT_FOUND` / `*_ERROR`). Policy handoff thẳng sang verifier (`DRAFT_READY`), verifier trả về coordinator (`APPROVED`). `case_received`/`case_finalized` do CLI emit.
 
 ---
 
@@ -96,7 +105,7 @@ class AgentOutputDict(TypedDict):
 
 1. **Thứ tự thực thi (Execution Order)**:
    - **Bước 1**: `coordinator` nhận input case $\rightarrow$ emit `case_received` $\rightarrow$ tạo `CaseState` $\rightarrow$ emit `task_assigned` bàn giao cho `order-item-agent`.
-   - **Bước 2**: `order-item-agent` truy vấn MCP (`get_order`, `get_order_items`, `get_seller`), lưu bằng chứng vào `evidence_pool`, emit `tool_result_consumed`, cập nhật context $\rightarrow$ emit `handoff` chuyển giao cho `payment-agent` và `shipment-agent`.
+   - **Bước 2**: `order-item-agent` truy vấn MCP (`get_order`, `get_order_items`), lưu bằng chứng vào `evidence_pool`, emit `tool_result_consumed`, cập nhật context $\rightarrow$ emit `handoff` chuyển giao cho `payment-agent` và `shipment-agent`.
    - **Bước 3**: `payment-agent` và `shipment-agent` chạy độc lập truy vấn domain tương ứng, emit `tool_result_consumed`, cập nhật context $\rightarrow$ emit `handoff` chuyển tiếp cho `policy-agent`.
    - **Bước 4**: `policy-agent` tổng hợp context, tra cứu `get_policy`, xác định primary issue, root causes, tiền bồi hoàn $\rightarrow$ emit `policy_decided` $\rightarrow$ emit `handoff` chuyển sang `verifier`.
    - **Bước 5**: `verifier` thực hiện kiểm định Invariants $\rightarrow$ emit `verification_completed` $\rightarrow$ bàn giao kết quả về cho `coordinator`.
